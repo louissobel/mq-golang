@@ -51,13 +51,24 @@ type cbInfo struct {
 	callbackArea     interface{}
 	connectionArea   interface{}
 	otelOpts         OtelOpts
+
+	hConn C.MQHCONN
+
+	id unsafe.Pointer
 }
 
-// This map is indexed by a combination of the hConn and hObj values
-var cbMap = make(map[string]*cbInfo)
+// Datastructure to store / delete registered callbacks
+type cbInfoMap struct {
+	sync.Mutex
 
-// Add a mutex to control access to it as there may be several threads going for different qmgrs
-var mutex sync.Mutex
+	byHConnAndHObj map[string]*cbInfo
+	byID           map[uintptr]*cbInfo
+}
+
+var cbMap *cbInfoMap = &cbInfoMap{
+	byHConnAndHObj: make(map[string]*cbInfo),
+	byID:           make(map[uintptr]*cbInfo),
+}
 
 /*
 MQCALLBACK_Go is a wrapper callback function that will invoke the user-supplied callback
@@ -68,8 +79,6 @@ accessible from a C function. See mqicb_c.go for the proxy/gateway C function th
 */
 //export MQCALLBACK_Go
 func MQCALLBACK_Go(hConn C.MQHCONN, mqmd *C.MQMD, mqgmo *C.MQGMO, mqBuffer C.PMQVOID, mqcbc *C.MQCBC) {
-
-	var cbHObj *MQObject
 
 	// Find the real callback function and invoke it
 	// Invoked function should match signature of the MQCB_FUNCTION type
@@ -98,36 +107,9 @@ func MQCALLBACK_Go(hConn C.MQHCONN, mqmd *C.MQMD, mqgmo *C.MQGMO, mqBuffer C.PMQ
 		verb: "MQCALLBACK",
 	}
 
-	key := makeKey(hConn, mqcbc.Hobj)
-	mapLock()
-	info, ok := cbMap[key]
-	mapUnlock()
-
-	// The MQ Client libraries sometimes call us with an EVENT that is
-	// not associated with a particular hObj.
-	// The way I've chosen is to find the first entry in
-	// the map associated with the hConn and call its registered function with
-	// a dummy hObj.
-	if !ok {
-		if gocbc.CallType == MQCBCT_EVENT_CALL && mqcbc.Hobj == C.MQHO_NONE {
-			key = makePartialKey(hConn)
-			mapLock()
-			for k, i := range cbMap {
-				if strings.HasPrefix(k, key) {
-					ok = true
-					info = i
-					cbHObj = &MQObject{qMgr: info.hObj.qMgr, Name: ""}
-					// Only care about finding one match in the table
-					break
-				}
-			}
-			mapUnlock()
-		}
-	} else {
-		cbHObj = info.hObj
-	}
-
+	info, ok := cbMap.byID[uintptr(mqcbc.CallbackArea)]
 	if ok {
+		cbHObj := info.hObj
 		if gogmo.MsgHandle.hMsg != C.MQHM_NONE {
 			gogmo.MsgHandle.qMgr = cbHObj.qMgr
 		}
@@ -201,11 +183,24 @@ func (object *MQObject) CB(goOperation int32, gocbd *MQCBD, gomd *MQMD, gogmo *M
 	copyMDtoC(&mqmd, gomd)
 	copyGMOtoC(&mqgmo, gogmo)
 
-	key := makeKey(object.qMgr.hConn, object.hObj)
-
 	// The callback function is a C function that is a proxy for the MQCALLBACK_Go function
 	// defined here. And that in turn will call the user's callback function
 	mqcbd.CallbackFunction = (C.MQPTR)(unsafe.Pointer(C.MQCALLBACK_C))
+
+	if mqOperation == C.MQOP_REGISTER {
+		// Stash the hObj and real function to be called
+		info := &cbInfo{hObj: object,
+			callbackFunction: gocbd.CallbackFunction,
+			connectionArea:   nil,
+			callbackArea:     gocbd.CallbackArea,
+		}
+		info.otelOpts.Context = gogmo.OtelOpts.Context
+		info.otelOpts.RemoveRFH2 = gogmo.OtelOpts.RemoveRFH2
+
+		cbMap.register(object.qMgr.hConn, object.hObj, info)
+
+		mqcbd.CallbackArea = (C.MQPTR)(info.id)
+	}
 
 	C.MQCB(object.qMgr.hConn, mqOperation, (C.PMQVOID)(unsafe.Pointer(&mqcbd)),
 		object.hObj,
@@ -225,23 +220,7 @@ func (object *MQObject) CB(goOperation int32, gocbd *MQCBD, gomd *MQMD, gogmo *M
 	// Add or remove the control information in the map used by the callback routines
 	switch mqOperation {
 	case C.MQOP_DEREGISTER:
-		mapLock()
-		delete(cbMap, key)
-		mapUnlock()
-	case C.MQOP_REGISTER:
-		// Stash the hObj and real function to be called
-		info := &cbInfo{hObj: object,
-			callbackFunction: gocbd.CallbackFunction,
-			connectionArea:   nil,
-			callbackArea:     gocbd.CallbackArea,
-		}
-		info.otelOpts.Context = gogmo.OtelOpts.Context
-		info.otelOpts.RemoveRFH2 = gogmo.OtelOpts.RemoveRFH2
-
-		mapLock()
-		cbMap[key] = info
-		mapUnlock()
-
+		cbMap.deregister(object.qMgr.hConn, object.hObj)
 	default: // Other values leave the map alone
 	}
 
@@ -260,11 +239,21 @@ func (object *MQQueueManager) CB(goOperation int32, gocbd *MQCBD) error {
 	mqOperation = C.MQLONG(goOperation)
 	copyCBDtoC(&mqcbd, gocbd)
 
-	key := makeKey(object.hConn, C.MQHO_NONE)
-
 	// The callback function is a C function that is a proxy for the MQCALLBACK_Go function
 	// defined here. And that in turn will call the user's callback function
 	mqcbd.CallbackFunction = (C.MQPTR)(unsafe.Pointer(C.MQCALLBACK_C))
+
+	if mqOperation == C.MQOP_REGISTER {
+		// Stash an hObj and real function to be called
+		info := &cbInfo{hObj: &MQObject{qMgr: object, Name: ""},
+			callbackFunction: gocbd.CallbackFunction,
+			connectionArea:   nil,
+			callbackArea:     gocbd.CallbackArea,
+		}
+		cbMap.register(object.hConn, C.MQHO_NONE, info)
+
+		mqcbd.CallbackArea = (C.MQPTR)(info.id)
+	}
 
 	C.MQCB(object.hConn, mqOperation, (C.PMQVOID)(unsafe.Pointer(&mqcbd)),
 		C.MQHO_NONE, nil, nil,
@@ -283,19 +272,7 @@ func (object *MQQueueManager) CB(goOperation int32, gocbd *MQCBD) error {
 	// Add or remove the control information in the map used by the callback routines
 	switch mqOperation {
 	case C.MQOP_DEREGISTER:
-		mapLock()
-		delete(cbMap, key)
-		mapUnlock()
-	case C.MQOP_REGISTER:
-		// Stash an hObj and real function to be called
-		info := &cbInfo{hObj: &MQObject{qMgr: object, Name: ""},
-			callbackFunction: gocbd.CallbackFunction,
-			connectionArea:   nil,
-			callbackArea:     gocbd.CallbackArea,
-		}
-		mapLock()
-		cbMap[key] = info
-		mapUnlock()
+		cbMap.deregister(object.hConn, C.MQHO_NONE)
 	default: // Other values leave the map alone
 	}
 
@@ -319,14 +296,7 @@ func (x *MQQueueManager) Ctl(goOperation int32, goctlo *MQCTLO) error {
 
 	// Need to make sure control information is available before the callback
 	// is enabled. So this gets setup even if the MQCTL fails.
-	key := makePartialKey(x.hConn)
-	mapLock()
-	for k, info := range cbMap {
-		if strings.HasPrefix(k, key) {
-			info.connectionArea = goctlo.ConnectionArea
-		}
-	}
-	mapUnlock()
+	cbMap.setConnectionArea(x.hConn, goctlo.ConnectionArea)
 
 	C.MQCTL(x.hConn, mqOperation, (C.PMQVOID)(unsafe.Pointer(&mqctlo)), &mqcc, &mqrc)
 
@@ -346,39 +316,73 @@ func (x *MQQueueManager) Ctl(goOperation int32, goctlo *MQCTLO) error {
 
 // Functions below here manage the map of objects and control information so that
 // the Go variables can be saved/restored from invocations to the C layer
-func makeKey(hConn C.MQHCONN, hObj C.MQHOBJ) string {
+
+func cbRemoveConnection(hConn C.MQHCONN) {
+	cbMap.removeAllFor(hConn)
+}
+
+func cbRemoveHandle(hConn C.MQHCONN, hObj C.MQHOBJ) {
+	cbMap.deregister(hConn, hObj)
+}
+
+func (m *cbInfoMap) setConnectionArea(hConn C.MQHCONN, connectionArea interface{}) {
+	m.Lock()
+	defer m.Unlock()
+
+	for _, info := range m.byID {
+		if info.hConn == hConn {
+			info.connectionArea = connectionArea
+		}
+	}
+}
+
+func (m *cbInfoMap) deregister(hConn C.MQHCONN, hObj C.MQHOBJ) {
+	m.Lock()
+	defer m.Unlock()
+
+	key := m.makeKey(hConn, hObj)
+	info, ok := m.byHConnAndHObj[key]
+	if ok {
+		delete(m.byHConnAndHObj, key)
+		delete(m.byID, uintptr(info.id))
+		C.free(info.id)
+	}
+}
+
+func (m *cbInfoMap) register(hConn C.MQHCONN, hObj C.MQHOBJ, info *cbInfo) {
+	m.Lock()
+	defer m.Unlock()
+
+	info.id = unsafe.Pointer(C.malloc(1))
+
+	key := m.makeKey(hConn, hObj)
+
+	m.byHConnAndHObj[key] = info
+	m.byID[uintptr(info.id)] = info
+}
+
+// Functions to delete any structures used to map C elements to Go
+func (m *cbInfoMap) removeAllFor(hConn C.MQHCONN) {
+	m.Lock()
+	defer m.Unlock()
+
+	// Remove all of the hObj values for this hconn
+	key := m.makePartialKey(hConn)
+	for k, info := range m.byHConnAndHObj {
+		if strings.HasPrefix(k, key) {
+			delete(m.byHConnAndHObj, k)
+			delete(m.byID, uintptr(info.id))
+			C.free(info.id)
+		}
+	}
+}
+
+func (m *cbInfoMap) makeKey(hConn C.MQHCONN, hObj C.MQHOBJ) string {
 	key := fmt.Sprintf("%d/%d", hConn, hObj)
 	return key
 }
 
-func makePartialKey(hConn C.MQHCONN) string {
+func (m *cbInfoMap) makePartialKey(hConn C.MQHCONN) string {
 	key := fmt.Sprintf("%d/", hConn)
 	return key
-}
-
-// Functions to delete any structures used to map C elements to Go
-func cbRemoveConnection(hConn C.MQHCONN) {
-	// Remove all of the hObj values for this hconn
-	key := makePartialKey(hConn)
-	mapLock()
-	for k, _ := range cbMap {
-		if strings.HasPrefix(k, key) {
-			delete(cbMap, k)
-		}
-	}
-	mapUnlock()
-}
-
-func cbRemoveHandle(hConn C.MQHCONN, hObj C.MQHOBJ) {
-	key := makeKey(hConn, hObj)
-	mapLock()
-	delete(cbMap, key)
-	mapUnlock()
-}
-
-func mapLock() {
-	mutex.Lock()
-}
-func mapUnlock() {
-	mutex.Unlock()
 }
